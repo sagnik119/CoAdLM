@@ -26,13 +26,39 @@ class CorDADecomposition:
       3. Inserts an adapter submodule (holding the low-rank parameters) into each linear layer.
          The base weight is frozen and only the adapter submodules are trainable.
     """
-    def __init__(self, model, adapter_rank=8, mode="knowledge_preserved"):
+    def __init__(self, model, adapter_rank=8, mode="knowledge_preserved",
+                saliency_method="grad_norm", adapter_fraction=0.1):
         self.model = model
         self.adapter_rank = adapter_rank
-        assert mode in ["knowledge_preserved", "instruction_previewed"], \
-            "mode must be 'knowledge_preserved' or 'instruction_previewed'"
         self.mode = mode
-        self.activation_dict = {}  # Move this to instance variable
+        self.saliency_method = saliency_method
+        self.adapter_fraction = adapter_fraction
+        self.activation_dict = {}
+        
+    def compute_saliency(self, samples_fn, device):
+        saliencies = {}
+        
+        # Register gradient hooks
+        handles = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                def hook(module, grad_input, grad_output, name=name):
+                    if module.weight.grad is not None:
+                        saliencies[name] = torch.norm(module.weight.grad).item()
+                handles.append(module.register_full_backward_hook(hook))
+
+        # Forward/backward pass
+        self.model.train()
+        xb, yb = samples_fn('train', 256, device, batch_size=32)
+        _, loss = self.model(xb, yb)
+        loss.backward()
+
+        # Cleanup
+        for h in handles:
+            h.remove()
+        self.model.zero_grad()
+        
+        return saliencies
 
     def hook_fn(self, module, inputs, outputs, name):
         # Get the first input tensor - matches pattern for nn.Linear which takes a single input tensor
@@ -84,17 +110,23 @@ class CorDADecomposition:
         else:
             collected = sum(1 for v in self.activation_dict.values() if len(v) > 0)
             print(f"Collected activations for {collected} linear layers.")
+            
+        # Compute saliency and select layers
+        saliencies = self.compute_saliency(samples_fn, device)
+        sorted_layers = sorted(saliencies.items(), key=lambda x: -x[1])
+        num_selected = max(1, int(len(sorted_layers) * self.adapter_fraction))
+        selected_layers = {k for k, v in sorted_layers[:num_selected]}
         
-        self.compute_adapters(self.activation_dict)
+        self.compute_adapters(self.activation_dict, selected_layers)
 
-    def compute_adapters(self, activation_dict):
+    def compute_adapters(self, activation_dict, selected_layers):
         """
         For each linear layer with collected activations, perform SVD on W @ Cov and
         insert an adapter submodule with the low-rank update parameters.
         """
         with torch.no_grad():
             for n, module in self.model.named_modules():
-                if isinstance(module, nn.Linear) and n in activation_dict and activation_dict[n]:
+                if n in selected_layers and isinstance(module, nn.Linear) and n in activation_dict and activation_dict[n]:
                     # Concatenate all collected activations for this layer
                     X = torch.cat(activation_dict[n], dim=0)  # (N, in_dim)
                     N = X.size(0)

@@ -16,7 +16,7 @@ def count_parameters(model):
             trainable_params += num
     return total_params, trainable_params, (total_params - trainable_params)
 
-def approximate_transformer_flops(model, batch_size, seq_len, steps, fraction_trainable=1.0):
+def approximate_transformer_flops(model, batch_size, seq_len, steps, fraction_trainable=1.0, fraction_adapted=1.0):
     """
     Approximates total FLOPs for training steps iterations on a transformer model.
     It uses the following approximations:
@@ -37,7 +37,7 @@ def approximate_transformer_flops(model, batch_size, seq_len, steps, fraction_tr
     ff_flops_per_layer = B * T * d_model * d_ff
     forward_flops_per_layer = attn_flops_per_layer + ff_flops_per_layer
 
-    forward_flops_per_iter = n_layers * forward_flops_per_layer
+    forward_flops_per_iter = fraction_adapted * n_layers * forward_flops_per_layer
 
     activation_backprop_factor = 1.5
     param_grad_factor = 1.0 * fraction_trainable
